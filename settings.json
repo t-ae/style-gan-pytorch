@@ -1,0 +1,34 @@
+{
+    "file_name_pattern": "*/*/*_00.png",
+    "use_cuda": true,
+    "detect_anomaly": false,
+    "start_level": 2,
+    "max_level": 7,
+    "batch_sizes": [64, 32, 16, 16, 8, 8, 8],
+    "num_images_in_stage": 1000000,
+    "loss": "wgan",
+    "use_yuv": false,
+    "reset_optimizer": true,
+    "learning_rates": {
+        "latent_transformation": 1e-5,
+        "generator": 1e-3,
+        "discriminator": 1e-3
+    },
+    "network": {
+        "z_dimension": 512,
+        "w_dimension": 512,
+        "epsilon": 1e-8,
+        "normalize_latents": false,
+        "pixel_norm_unit_length": true,
+        "style_mixing_prob": 0.9
+    },
+    "data_augmentation":{
+        "flip": false,
+        "color_shift": false
+    },
+    "save_steps":{
+        "image": 10,
+        "model": 10000,
+        "histogram": -1
+    }
+}
