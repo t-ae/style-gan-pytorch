@@ -1,11 +1,12 @@
 {
     "file_name_pattern": "*/*/*_00.png",
     "use_cuda": true,
+    "use_apex": true,
     "detect_anomaly": false,
     "start_level": 2,
     "max_level": 7,
     "batch_sizes": [64, 32, 16, 16, 8, 8, 8],
-    "num_images_in_stage": 1000000,
+    "num_images_in_stage": 1200000,
     "loss": "wgan",
     "use_yuv": false,
     "reset_optimizer": true,
@@ -27,7 +28,7 @@
         "color_shift": false
     },
     "save_steps":{
-        "image": 10,
+        "image": 1000,
         "model": 10000,
         "histogram": -1
     }

@@ -112,18 +112,14 @@ class WSConvTranspose2d(nn.Module):
 
 
 class AdaIN(nn.Module):
-    def __init__(self, dim, w_dim, epsilon):
+    def __init__(self, dim, w_dim):
         super().__init__()
         self.dim = dim
-        self.epsilon = epsilon
+        self.epsilon = 1e-8
         self.transform = WSConv2d(w_dim, dim*2, 1, 1, 0)
 
     def forward(self, x, w):
-        # Instance norm
-        x_mean = x.mean((2, 3), keepdim=True)
-        x = x - x_mean
-        x_mean2 = (x**2).mean((2, 3), keepdim=True)
-        x = x * torch.rsqrt(x_mean2 + self.epsilon)
+        x = F.instance_norm(x, eps=self.epsilon)
 
         # scale
         style = self.transform(w).view([-1, 2, self.dim, 1, 1])
@@ -191,7 +187,7 @@ class LatentTransformation(nn.Module):
 
 
 class SynthFirstBlock(nn.Module):
-    def __init__(self, start_dim, output_dim, w_dim, epsilon):
+    def __init__(self, start_dim, output_dim, w_dim):
         super().__init__()
 
         self.base_image = nn.Parameter(torch.ones(1, start_dim, 4, 4))
@@ -201,8 +197,8 @@ class SynthFirstBlock(nn.Module):
         self.noise1 = NoiseLayer(start_dim, 4)
         self.noise2 = NoiseLayer(output_dim, 4)
 
-        self.adain1 = AdaIN(start_dim, w_dim, epsilon)
-        self.adain2 = AdaIN(output_dim, w_dim, epsilon)
+        self.adain1 = AdaIN(start_dim, w_dim)
+        self.adain2 = AdaIN(output_dim, w_dim)
 
         self.activation = nn.LeakyReLU(negative_slope=0.2)
 
@@ -223,7 +219,7 @@ class SynthFirstBlock(nn.Module):
 
 
 class SynthBlock(nn.Module):
-    def __init__(self, input_dim, output_dim, output_size, w_dim, epsilon):
+    def __init__(self, input_dim, output_dim, output_size, w_dim):
         super().__init__()
 
         self.conv1 = WSConv2d(input_dim, output_dim, 3, 1, 1)
@@ -232,8 +228,8 @@ class SynthBlock(nn.Module):
         self.noise1 = NoiseLayer(output_dim, output_size)
         self.noise2 = NoiseLayer(output_dim, output_size)
 
-        self.adain1 = AdaIN(output_dim, w_dim, epsilon)
-        self.adain2 = AdaIN(output_dim, w_dim, epsilon)
+        self.adain1 = AdaIN(output_dim, w_dim)
+        self.adain2 = AdaIN(output_dim, w_dim)
 
         self.activation = nn.LeakyReLU(negative_slope=0.2)
 
@@ -262,13 +258,13 @@ class SynthesisModule(nn.Module):
         epsilon = settings["epsilon"]
 
         self.blocks = nn.ModuleList([
-            SynthFirstBlock(512, 512, self.w_dim, epsilon),
-            SynthBlock(512, 512, 8, self.w_dim, epsilon),
-            SynthBlock(512, 256, 16, self.w_dim, epsilon),
-            SynthBlock(256, 128, 32, self.w_dim, epsilon),
-            SynthBlock(128, 64, 64, self.w_dim, epsilon),
-            SynthBlock(64, 32, 128, self.w_dim, epsilon),
-            SynthBlock(32, 16, 256, self.w_dim, epsilon)
+            SynthFirstBlock(512, 512, self.w_dim),
+            SynthBlock(512, 512, 8, self.w_dim),
+            SynthBlock(512, 256, 16, self.w_dim),
+            SynthBlock(256, 128, 32, self.w_dim),
+            SynthBlock(128, 64, 64, self.w_dim),
+            SynthBlock(64, 32, 128, self.w_dim),
+            SynthBlock(32, 16, 256, self.w_dim)
         ])
 
         self.to_rgbs = nn.ModuleList([

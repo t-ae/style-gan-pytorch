@@ -5,7 +5,6 @@ import shutil
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import torch
-import torch.nn.functional as F
 import torch.backends.cudnn
 import torch.autograd
 import torch.optim as optim
@@ -13,15 +12,16 @@ import torch.utils.data
 from tensorboardX import SummaryWriter
 import torchvision
 
+from apex import amp
+
 import network
+import loss
 import data_loader
 import image_converter
 import utils
 
 # parameters
 SETTING_JSON_PATH = "./settings.json"
-EPSILON_DRIFT = 1e-3
-LAMBDA_GP = 10
 
 
 def main():
@@ -39,61 +39,14 @@ def main():
         train(settings, output_root)
 
 
-def d_wgan_loss(discriminator, trues, fakes, alpha):
-    batch_size = fakes.size()[0]
-    d_trues = discriminator.forward(trues, alpha)
-    d_fakes = discriminator.forward(fakes, alpha)
-
-    loss_wd = (d_trues - d_fakes).mean()
-
-    # gradient penalty
-    epsilon = torch.randn(batch_size, 1, 1, 1, dtype=fakes.dtype, device=fakes.device)
-    intpl = epsilon * fakes + (1 - epsilon) * trues
-    intpl.requires_grad_()
-    f = discriminator.forward(intpl, alpha)
-    df = torch.autograd.grad(f, intpl,
-                             grad_outputs=torch.ones(*f.size(), device=f.device, dtype=f.dtype),
-                             retain_graph=True, create_graph=True, only_inputs=True)[0]
-    df_norm = df.view(batch_size, -1).norm(dim=1)
-    loss_gp = LAMBDA_GP * ((df_norm - 1) ** 2).mean()
-
-    # drift
-    loss_drift = EPSILON_DRIFT * (d_trues ** 2).mean()
-
-    loss = -loss_wd + loss_gp + loss_drift
-
-    wd = loss_wd.mean().item()
-
-    return loss, wd
-
-
-def d_lsgan_loss(discriminator, trues, fakes, alpha):
-    d_trues = discriminator.forward(trues, alpha)
-    d_fakes = discriminator.forward(fakes, alpha)
-
-    loss = F.mse_loss(d_trues, torch.ones_like(d_trues)) + F.mse_loss(d_fakes, torch.zeros_like(d_fakes))
-    loss /= 2
-    return loss
-
-
-def g_wgan_loss(discriminator, fakes, alpha):
-    d_fakes = discriminator.forward(fakes, alpha)
-    loss = -d_fakes.mean()
-    return loss
-
-
-def g_lsgan_loss(discriminator, fakes, alpha):
-    d_fakes = discriminator.forward(fakes, alpha)
-    loss = F.mse_loss(d_fakes, torch.ones_like(d_fakes)) / 2
-    return loss
-
-
 def train(settings, output_root):
     # directories
     weights_root = output_root.joinpath("weights")
     weights_root.mkdir()
 
     # settings
+    amp_handle = amp.init(settings["use_apex"])
+
     if settings["use_cuda"]:
         device = torch.device("cuda:0")
     else:
@@ -144,7 +97,8 @@ def train(settings, output_root):
 
     # log
     writer = SummaryWriter(str(output_root.joinpath("logdir")))
-    test_zs = utils.create_test_z(z_dim)
+    test_cols = 6
+    test_zs = utils.create_test_z(12, test_cols, z_dim)
     test_z0 = torch.from_numpy(test_zs[0]).to(test_device, test_dtype)
     test_z1 = torch.from_numpy(test_zs[1]).to(test_device, test_dtype)
 
@@ -179,25 +133,31 @@ def train(settings, output_root):
             fakes_nograd = fakes.detach()
 
             # === train discriminator ===
+            for param in discriminator.parameters():
+                param.requires_grad_(True)
             if loss_type == "wgan":
-                d_loss, wd = d_wgan_loss(discriminator, trues, fakes_nograd, alpha)
+                d_loss, wd = loss.d_wgan_loss(discriminator, trues, fakes_nograd, alpha)
             elif loss_type == "lsgan":
-                d_loss = d_lsgan_loss(discriminator, trues, fakes_nograd, alpha)
+                d_loss = loss.d_lsgan_loss(discriminator, trues, fakes_nograd, alpha)
             else:
                 raise Exception(f"Invalid loss: {loss_type}")
 
-            d_loss.backward()
+            with amp_handle.scale_loss(d_loss, d_opt) as scaled_loss:
+                scaled_loss.backward()
             d_opt.step()
 
             # === train generator ===
+            for param in discriminator.parameters():
+                param.requires_grad_(False)
             if loss_type == "wgan":
-                g_loss = g_wgan_loss(discriminator, fakes, alpha)
+                g_loss = loss.g_wgan_loss(discriminator, fakes, alpha)
             elif loss_type == "lsgan":
-                g_loss = g_lsgan_loss(discriminator, fakes, alpha)
+                g_loss = loss.g_lsgan_loss(discriminator, fakes, alpha)
             else:
                 raise Exception(f"Invalid loss: {loss_type}")
 
-            g_loss.backward()
+            with amp_handle.scale_loss(g_loss, g_opt) as scaled_loss:
+                scaled_loss.backward()
             g_opt.step()
 
             # log
@@ -226,12 +186,12 @@ def train(settings, output_root):
                     eval_gen = network.Generator(settings["network"]).to(test_device, test_dtype).eval()
                     eval_gen.load_state_dict(generator.state_dict())
                     fakes = eval_gen.forward(test_z0, alpha)
-                    fakes = torchvision.utils.make_grid(fakes, nrow=4)
+                    fakes = torchvision.utils.make_grid(fakes, nrow=test_cols, padding=0)
                     fakes = fakes.to(torch.float32).cpu().numpy()
                     fakes = converter.from_generator_output(fakes)
                     writer.add_image(f"lv{level}_{fading_text}/intpl", torch.from_numpy(fakes), step)
                     fakes = eval_gen.forward(test_z1, alpha)
-                    fakes = torchvision.utils.make_grid(fakes, nrow=4)
+                    fakes = torchvision.utils.make_grid(fakes, nrow=test_cols, padding=0)
                     fakes = fakes.to(torch.float32).cpu().numpy()
                     fakes = converter.from_generator_output(fakes)
                     writer.add_image(f"lv{level}_{fading_text}/random", torch.from_numpy(fakes), step)
