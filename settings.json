@@ -5,7 +5,7 @@
     "detect_anomaly": false,
     "start_level": 2,
     "max_level": 7,
-    "batch_sizes": [64, 32, 16, 16, 8, 8, 8],
+    "batch_sizes": [128, 64, 32, 32, 16, 16, 8],
     "num_images_in_stage": 1200000,
     "loss": "wgan",
     "use_yuv": false,
@@ -16,11 +16,10 @@
         "discriminator": 1e-3
     },
     "network": {
-        "z_dimension": 512,
-        "w_dimension": 512,
+        "z_dim": 512,
+        "w_dim": 512,
         "epsilon": 1e-8,
-        "normalize_latents": false,
-        "pixel_norm_unit_length": true,
+        "normalize_latents": true,
         "style_mixing_prob": 0.9
     },
     "data_augmentation":{

@@ -58,7 +58,7 @@ def train(settings, output_root):
 
     loss_type = settings["loss"]
 
-    z_dim = settings["network"]["z_dimension"]
+    z_dim = settings["network"]["z_dim"]
 
     # model
     generator = network.Generator(settings["network"]).to(device, dtype)
@@ -96,7 +96,7 @@ def train(settings, output_root):
     step = 0
 
     # log
-    writer = SummaryWriter(str(output_root.joinpath("logdir")))
+    writer = SummaryWriter(str(output_root))
     test_cols = 6
     test_zs = utils.create_test_z(12, test_cols, z_dim)
     test_z0 = torch.from_numpy(test_zs[0]).to(test_device, test_dtype)

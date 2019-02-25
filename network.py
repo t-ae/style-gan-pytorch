@@ -8,21 +8,15 @@ import torch.nn.functional as F
 class PixelNormalizationLayer(nn.Module):
     def __init__(self, settings):
         super().__init__()
-        self.use_unit_length = settings["pixel_norm_unit_length"]
         self.epsilon = settings["epsilon"]
 
     def forward(self, x):
         # x is [B, C, H, W]
         x2 = x ** 2
 
-        length_inv = torch.rsqrt(x2.sum(1, keepdim=True) + self.epsilon)
+        length_inv = torch.rsqrt(x2.mean(1, keepdim=True) + self.epsilon)
 
-        if self.use_unit_length:
-            # unit length
-            return x * length_inv
-        else:
-            # original code
-            return np.sqrt(x.size()[1]) * x * length_inv
+        return x * length_inv
 
 
 class MinibatchStdConcatLayer(nn.Module):
@@ -73,6 +67,21 @@ class MinibatchStdConcatLayer(nn.Module):
         y2 = y2.to(x.dtype)
 
         return torch.cat([x, y1, y2], 1)
+
+
+class Blur3x3(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+        f = np.array([1, 2, 1], dtype=np.float32)
+        f = f[None, :] * f[:, None]
+        f /= np.sum(f)
+        f = f.reshape([1, 1, 3, 3]).repeat(dim, axis=0)
+        self.register_buffer("filter", torch.from_numpy(f))
+
+    def forward(self, x):
+        return F.conv2d(x, self.filter, padding=1, groups=self.dim)
 
 
 class WSConv2d(nn.Module):
@@ -154,8 +163,8 @@ class LatentTransformation(nn.Module):
     def __init__(self, settings):
         super().__init__()
 
-        self.z_dim = settings["z_dimension"]
-        self.w_dim = settings["w_dimension"]
+        self.z_dim = settings["z_dim"]
+        self.w_dim = settings["w_dim"]
         self.latent_normalization = PixelNormalizationLayer(settings) if settings["normalize_latents"] else None
         activation = nn.LeakyReLU(negative_slope=0.2)
 
@@ -202,18 +211,18 @@ class SynthFirstBlock(nn.Module):
 
         self.activation = nn.LeakyReLU(negative_slope=0.2)
 
-    def forward(self, w):
-        batch_size = w.size()[0]
+    def forward(self, w1, w2):
+        batch_size = w1.size()[0]
 
         x = self.base_image.expand(batch_size, -1, -1, -1)
         x = self.noise1(x)
         x = self.activation(x)
-        x = self.adain1(x, w)
+        x = self.adain1(x, w1)
 
         x = self.conv(x)
         x = self.noise2(x)
         x = self.activation(x)
-        x = self.adain2(x, w)
+        x = self.adain2(x, w2)
 
         return x
 
@@ -222,8 +231,9 @@ class SynthBlock(nn.Module):
     def __init__(self, input_dim, output_dim, output_size, w_dim):
         super().__init__()
 
-        self.conv1 = WSConv2d(input_dim, output_dim, 3, 1, 1)
+        self.conv1 = WSConvTranspose2d(input_dim, output_dim, 4, 2, 1)
         self.conv2 = WSConv2d(output_dim, output_dim, 3, 1, 1)
+        self.blur = Blur3x3(output_dim)
 
         self.noise1 = NoiseLayer(output_dim, output_size)
         self.noise2 = NoiseLayer(output_dim, output_size)
@@ -233,18 +243,17 @@ class SynthBlock(nn.Module):
 
         self.activation = nn.LeakyReLU(negative_slope=0.2)
 
-    def forward(self, x, w):
-        x = F.interpolate(x, scale_factor=2, mode="bilinear")
-
+    def forward(self, x, w1, w2):
         x = self.conv1(x)
+        x = self.blur(x)
         x = self.noise1(x)
         x = self.activation(x)
-        x = self.adain1(x, w)
+        x = self.adain1(x, w1)
 
         x = self.conv2(x)
         x = self.noise2(x)
         x = self.activation(x)
-        x = self.adain2(x, w)
+        x = self.adain2(x, w2)
 
         return x
 
@@ -253,7 +262,7 @@ class SynthesisModule(nn.Module):
     def __init__(self, settings):
         super().__init__()
 
-        self.w_dim = settings["w_dimension"]
+        self.w_dim = settings["w_dim"]
 
         epsilon = settings["epsilon"]
 
@@ -285,27 +294,27 @@ class SynthesisModule(nn.Module):
                 module.fixed = fixed
 
     def forward(self, w, alpha):
-        # w is [batch_size. level, w_dim, 1, 1]
+        # w is [batch_size. level*2, w_dim, 1, 1]
         level = self.level.item()
 
-        x = self.blocks[0](w[:, 0])
+        x = self.blocks[0](w[:, 0], w[:, 1])
 
         if level == 1:
             x = self.to_rgbs[0](x)
             return x
 
         for i in range(1, level-1):
-            x = self.blocks[i](x, w[:, i])
+            x = self.blocks[i](x, w[:, i*2], w[:, i*2+1])
 
         x2 = x
-        x2 = self.blocks[level-1](x2, w[:, level-1])
+        x2 = self.blocks[level-1](x2, w[:, level*2-2], w[:, level*2-1])
         x2 = self.to_rgbs[level-1](x2)
 
         if alpha == 1:
             x = x2
         else:
             x1 = self.to_rgbs[level - 2](x)
-            x1 = F.interpolate(x1, scale_factor=2, mode="bilinear")
+            x1 = F.interpolate(x1, scale_factor=2, mode="nearest")
             x = torch.lerp(x1, x2, alpha)
 
         return x
@@ -319,6 +328,12 @@ class Generator(nn.Module):
         self.synthesis_module = SynthesisModule(settings)
         self.style_mixing_prob = settings["style_mixing_prob"]
 
+        #Truncation trick
+        self.register_buffer("w_average", torch.zeros(1, settings["z_dim"], 1, 1))
+        self.w_average_beta = 0.995
+        self.trunc_w_layers = 8
+        self.trunc_w_psi = 0.8
+
     def set_level(self, level):
         self.synthesis_module.level.fill_(level)
 
@@ -326,10 +341,16 @@ class Generator(nn.Module):
         batch_size = z.size()[0]
         level = self.synthesis_module.level.item()
 
-        # w is [B, level, z_dim, 1, 1]
-        w = self.latent_transform(z)\
-            .view(batch_size, 1, -1, 1, 1)\
-            .expand(-1, level, -1, -1, -1)
+        w = self.latent_transform(z)
+
+        # update w_average
+        if self.training:
+            self.w_average = torch.lerp(w.detach().mean(0, keepdim=True), self.w_average, self.w_average_beta)
+
+        # w becomes [B, level*2, z_dim, 1, 1]
+        # level*2 is because each synthesis block has two points of style inputs
+        w = w.view(batch_size, 1, -1, 1, 1)\
+            .expand(-1, level*2, -1, -1, -1)
 
         # style mixing
         if self.training and level >= 2:
@@ -337,8 +358,14 @@ class Generator(nn.Module):
             w_mix = self.latent_transform(z_mix)
             for batch_index in range(batch_size):
                 if np.random.uniform(0, 1) < self.style_mixing_prob:
-                    cross_point = np.random.randint(1, level)
+                    cross_point = np.random.randint(1, level*2)
                     w[batch_index, cross_point:] = w_mix[batch_index]
+
+        # Truncation trick
+        if not self.training:
+            w[:, self.trunc_w_layers:] = torch.lerp(self.w_average,
+                                                    w[:, self.trunc_w_layers:],
+                                                    self.trunc_w_psi)
 
         fakes = self.synthesis_module(w, alpha)
 
@@ -350,15 +377,16 @@ class DBlock(nn.Module):
         super().__init__()
 
         self.conv1 = WSConv2d(inpit_dim, output_dim, 3, 1, 1)
-        self.conv2 = WSConv2d(output_dim, output_dim, 3, 1, 1)
+        self.conv2 = WSConv2d(output_dim, output_dim, 3, 2, 1)
+        self.blur = Blur3x3(output_dim)
         self.activation = nn.LeakyReLU(negative_slope=0.2)
 
     def forward(self, x):
         x = self.conv1(x)
         x = self.activation(x)
+        x = self.blur(x)
         x = self.conv2(x)
         x = self.activation(x)
-        x = F.avg_pool2d(x, 2)
         return x
 
 
@@ -368,7 +396,7 @@ class DLastBlock(nn.Module):
 
         self.conv1 = WSConv2d(input_dim, input_dim, 3, 1, 1)
         self.conv2 = WSConv2d(input_dim, input_dim, 4, 1, 0)
-        self.conv3 = WSConv2d(input_dim, 1, 3, 1, 1, gain=1)
+        self.conv3 = WSConv2d(input_dim, 1, 1, 1, 0, gain=1)
         self.activation = nn.LeakyReLU(negative_slope=0.2)
 
     def forward(self, x):
@@ -433,9 +461,7 @@ class Discriminator(nn.Module):
 
                 x = torch.lerp(x1, x2, alpha)
 
-            for l in range(1, level-1):
+            for l in range(1, level):
                 x = self.blocks[-level+l](x)
-
-            x = self.blocks[-1](x)
 
         return x.view([-1, 1])
