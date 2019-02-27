@@ -5,7 +5,7 @@
     "detect_anomaly": false,
     "start_level": 2,
     "max_level": 7,
-    "batch_sizes": [128, 64, 32, 32, 16, 16, 8],
+    "batch_sizes": [64, 32, 32, 16, 16, 8, 8],
     "num_images_in_stage": 1200000,
     "loss": "wgan",
     "use_yuv": false,

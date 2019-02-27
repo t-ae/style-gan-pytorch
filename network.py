@@ -231,7 +231,7 @@ class SynthBlock(nn.Module):
     def __init__(self, input_dim, output_dim, output_size, w_dim):
         super().__init__()
 
-        self.conv1 = WSConvTranspose2d(input_dim, output_dim, 4, 2, 1)
+        self.conv1 = WSConv2d(input_dim, output_dim, 3, 1, 1)
         self.conv2 = WSConv2d(output_dim, output_dim, 3, 1, 1)
         self.blur = Blur3x3(output_dim)
 
@@ -244,6 +244,7 @@ class SynthBlock(nn.Module):
         self.activation = nn.LeakyReLU(negative_slope=0.2)
 
     def forward(self, x, w1, w2):
+        x = F.interpolate(x, scale_factor=2)
         x = self.conv1(x)
         x = self.blur(x)
         x = self.noise1(x)
@@ -263,8 +264,6 @@ class SynthesisModule(nn.Module):
         super().__init__()
 
         self.w_dim = settings["w_dim"]
-
-        epsilon = settings["epsilon"]
 
         self.blocks = nn.ModuleList([
             SynthFirstBlock(512, 512, self.w_dim),
@@ -377,7 +376,7 @@ class DBlock(nn.Module):
         super().__init__()
 
         self.conv1 = WSConv2d(inpit_dim, output_dim, 3, 1, 1)
-        self.conv2 = WSConv2d(output_dim, output_dim, 3, 2, 1)
+        self.conv2 = WSConv2d(output_dim, output_dim, 3, 1, 1)
         self.blur = Blur3x3(output_dim)
         self.activation = nn.LeakyReLU(negative_slope=0.2)
 
@@ -387,6 +386,7 @@ class DBlock(nn.Module):
         x = self.blur(x)
         x = self.conv2(x)
         x = self.activation(x)
+        x = F.avg_pool2d(x, kernel_size=2)
         return x
 
 
