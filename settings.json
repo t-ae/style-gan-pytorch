@@ -22,7 +22,7 @@
         "normalize_latents": true,
         "style_mixing_prob": 0.9,
         "upsample_mode": "bilinear",
-        "use_labels": true,
+        "use_labels": false,
         "use_blur": false,
         "use_noise": true,
         "base_image_init": "one_normal"
@@ -36,10 +36,10 @@
         "model": 10000,
         "histogram": 30000
     },
-    "labels_ffhq": [
+    "labels": [
         "ffhq"
     ],
-    "labels": [
+    "labels8": [
         "hime_winter", "nico", "poppo",
         "poppo_mix", "sora", "sora_military",
         "star_breaker", "suguri_winter"
