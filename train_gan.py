@@ -61,8 +61,14 @@ def train(settings, output_root):
     z_dim = settings["network"]["z_dim"]
 
     # model
-    generator = network.Generator(settings["network"]).to(device, dtype)
-    discriminator = network.Discriminator(settings["network"]).to(device, dtype)
+    label_size = len(settings["labels"])
+    generator = network.Generator(settings["network"], label_size).to(device, dtype)
+    discriminator = network.Discriminator(settings["network"], label_size).to(device, dtype)
+
+    # long-term average
+    gs = network.Generator(settings["network"], label_size).to(device, dtype)
+    gs.load_state_dict(generator.state_dict())
+    gs_beta = settings["gs_beta"]
 
     lt_learning_rate = settings["learning_rates"]["latent_transformation"]
     g_learning_rate = settings["learning_rates"]["generator"]
@@ -75,13 +81,8 @@ def train(settings, output_root):
                        lr=d_learning_rate, betas=(0.0, 0.99), eps=1e-8)
 
     # train data
-    image_root: Path = Path(__file__).parent.joinpath("../images/")
-    image_paths = list(image_root.glob(settings["file_name_pattern"]))
+    loader = data_loader.LabeledDataLoader(settings)
 
-    print(settings["file_name_pattern"])
-    print(f"{len(image_paths)} images")
-    loader = data_loader.TrainDataLoader(image_paths,
-                                         settings["data_augmentation"])
     if settings["use_yuv"]:
         converter = image_converter.YUVConverter()
     else:
@@ -91,16 +92,21 @@ def train(settings, output_root):
     level = settings["start_level"]
     generator.set_level(level)
     discriminator.set_level(level)
+    gs.set_level(level)
     fading = False
     alpha = 1
     step = 0
 
     # log
     writer = SummaryWriter(str(output_root))
+    test_rows = 12
     test_cols = 6
-    test_zs = utils.create_test_z(12, test_cols, z_dim)
+    test_zs = utils.create_test_z(test_rows, test_cols, z_dim)
     test_z0 = torch.from_numpy(test_zs[0]).to(test_device, test_dtype)
     test_z1 = torch.from_numpy(test_zs[1]).to(test_device, test_dtype)
+    test_labels0 = torch.randint(0, loader.label_size, (1, test_cols))
+    test_labels0 = test_labels0.repeat(test_rows, 1).to(device)
+    test_labels1 = torch.randint(0, loader.label_size, (test_rows, test_cols), device=test_device).view(-1)
 
     for loop in range(9999999):
         size = 2 ** (level+1)
@@ -110,7 +116,7 @@ def train(settings, output_root):
 
         image_count = 0
 
-        for batch in loader.generate(batch_size, size, size):
+        for batch, labels in loader.generate(batch_size, size, size):
             # pre train
             step += 1
             image_count += batch_size
@@ -121,24 +127,26 @@ def train(settings, output_root):
             batch = batch.transpose([0, 3, 1, 2])
             batch = converter.to_train_data(batch)
             trues = torch.from_numpy(batch).to(device, dtype)
+            labels = torch.from_numpy(labels).to(device)
 
             # reset
             g_opt.zero_grad()
             d_opt.zero_grad()
 
-            # sample fakes
+            # === train discriminator ===
             z = utils.create_z(batch_size, z_dim)
             z = torch.from_numpy(z).to(device, dtype)
-            fakes = generator.forward(z, alpha)
+            fakes = generator.forward(z, labels, alpha)
             fakes_nograd = fakes.detach()
 
-            # === train discriminator ===
             for param in discriminator.parameters():
                 param.requires_grad_(True)
             if loss_type == "wgan":
-                d_loss, wd = loss.d_wgan_loss(discriminator, trues, fakes_nograd, alpha)
+                d_loss, wd = loss.d_wgan_loss(discriminator, trues, fakes_nograd, labels, alpha)
             elif loss_type == "lsgan":
-                d_loss = loss.d_lsgan_loss(discriminator, trues, fakes_nograd, alpha)
+                d_loss = loss.d_lsgan_loss(discriminator, trues, fakes_nograd, labels, alpha)
+            elif loss_type == "logistic":
+                d_loss = loss.d_logistic_loss(discriminator, trues, fakes_nograd, labels, alpha)
             else:
                 raise Exception(f"Invalid loss: {loss_type}")
 
@@ -147,18 +155,32 @@ def train(settings, output_root):
             d_opt.step()
 
             # === train generator ===
+            z = utils.create_z(batch_size, z_dim)
+            z = torch.from_numpy(z).to(device, dtype)
+            fakes = generator.forward(z, labels, alpha)
+
             for param in discriminator.parameters():
                 param.requires_grad_(False)
             if loss_type == "wgan":
-                g_loss = loss.g_wgan_loss(discriminator, fakes, alpha)
+                g_loss = loss.g_wgan_loss(discriminator, fakes, labels, alpha)
             elif loss_type == "lsgan":
-                g_loss = loss.g_lsgan_loss(discriminator, fakes, alpha)
+                g_loss = loss.g_lsgan_loss(discriminator, fakes, labels, alpha)
+            elif loss_type == "logistic":
+                g_loss = loss.g_logistic_loss(discriminator, fakes, labels, alpha)
             else:
                 raise Exception(f"Invalid loss: {loss_type}")
 
             with amp_handle.scale_loss(g_loss, g_opt) as scaled_loss:
                 scaled_loss.backward()
+                del scaled_loss
             g_opt.step()
+
+            del trues, fakes, fakes_nograd
+
+            # update gs
+            for gparam, gsparam in zip(generator.parameters(), gs.parameters()):
+                gsparam.data = (1-gs_beta) * gsparam.data + gs_beta * gparam.data
+            gs.w_average.data = (1-gs_beta) * gs.w_average.data + gs_beta * generator.w_average.data
 
             # log
             if step % 1 == 0:
@@ -172,38 +194,44 @@ def train(settings, output_root):
                 if loss_type == "wgan":
                     writer.add_scalar(f"lv{level}/wd", wd, global_step=step)
 
+            del d_loss, g_loss
+
             # histogram
             if settings["save_steps"]["histogram"] > 0 and step % settings["save_steps"]["histogram"] == 0:
-                for name, param in generator.named_parameters():
-                    writer.add_histogram(f"gen/{name}", param.cpu().data.numpy(), step)
+                gs.write_histogram(writer, step)
                 for name, param in discriminator.named_parameters():
                     writer.add_histogram(f"disc/{name}", param.cpu().data.numpy(), step)
 
             # image
-            if step % settings["save_steps"]["image"] == 0:
+            if step % settings["save_steps"]["image"] == 0 or alpha == 0:
                 fading_text = "fading" if fading else "stabilizing"
                 with torch.no_grad():
-                    eval_gen = network.Generator(settings["network"]).to(test_device, test_dtype).eval()
-                    eval_gen.load_state_dict(generator.state_dict())
-                    fakes = eval_gen.forward(test_z0, alpha)
+                    eval_gen = network.Generator(settings["network"], label_size).to(test_device, test_dtype).eval()
+                    eval_gen.load_state_dict(gs.state_dict())
+                    eval_gen.synthesis_module.set_noise_fixed(True)
+                    fakes = eval_gen.forward(test_z0, test_labels0, alpha)
                     fakes = torchvision.utils.make_grid(fakes, nrow=test_cols, padding=0)
                     fakes = fakes.to(torch.float32).cpu().numpy()
                     fakes = converter.from_generator_output(fakes)
                     writer.add_image(f"lv{level}_{fading_text}/intpl", torch.from_numpy(fakes), step)
-                    fakes = eval_gen.forward(test_z1, alpha)
+                    fakes = eval_gen.forward(test_z1, test_labels1, alpha)
                     fakes = torchvision.utils.make_grid(fakes, nrow=test_cols, padding=0)
                     fakes = fakes.to(torch.float32).cpu().numpy()
                     fakes = converter.from_generator_output(fakes)
                     writer.add_image(f"lv{level}_{fading_text}/random", torch.from_numpy(fakes), step)
+                    del eval_gen
+                # memory usage
+                writer.add_scalar("memory_allocated(MB)", torch.cuda.memory_allocated() / (1024*1024), global_step=step)
 
             # model save
-            if step % settings["save_steps"]["model"] == 0 and level >= 3 and not fading:
+            if step % settings["save_steps"]["model"] == 0 and level >= 5 and not fading:
                 savedir = weights_root.joinpath(f"{step}_lv{level}")
                 savedir.mkdir()
                 torch.save(generator.state_dict(), savedir.joinpath("gen.pth"))
+                torch.save(generator.state_dict(), savedir.joinpath("gs.pth"))
                 torch.save(discriminator.state_dict(), savedir.joinpath("disc.pth"))
 
-            # fading/stabilizing
+            # switch fading/stabilizing
             if image_count > settings["num_images_in_stage"]:
                 if fading:
                     print("start stabilizing")
@@ -219,6 +247,7 @@ def train(settings, output_root):
             level = level+1
             generator.set_level(level)
             discriminator.set_level(level)
+            gs.set_level(level)
             fading = True
             alpha = 0
             print(f"lv up: {level}")

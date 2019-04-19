@@ -1,34 +1,54 @@
 {
-    "file_name_pattern": "*/*/*_00.png",
     "use_cuda": true,
     "use_apex": true,
     "detect_anomaly": false,
     "start_level": 2,
     "max_level": 7,
-    "batch_sizes": [64, 32, 32, 16, 16, 8, 8],
+    "batch_sizes": [64, 64, 32, 32, 16, 8, 8],
     "num_images_in_stage": 1200000,
     "loss": "wgan",
     "use_yuv": false,
-    "reset_optimizer": true,
+    "reset_optimizer": false,
+    "gs_beta": 1e-4,
     "learning_rates": {
-        "latent_transformation": 1e-5,
-        "generator": 1e-3,
-        "discriminator": 1e-3
+        "latent_transformation": 0.00001,
+        "generator": 0.001,
+        "discriminator": 0.001
     },
     "network": {
-        "z_dim": 512,
-        "w_dim": 512,
+        "z_dim": 256,
+        "w_dim": 256,
         "epsilon": 1e-8,
         "normalize_latents": true,
-        "style_mixing_prob": 0.9
+        "style_mixing_prob": 0.9,
+        "upsample_mode": "bilinear",
+        "use_labels": true,
+        "use_blur": false,
+        "use_noise": true,
+        "base_image_init": "one_normal"
     },
     "data_augmentation":{
-        "flip": false,
+        "flip": true,
         "color_shift": false
     },
     "save_steps":{
         "image": 1000,
         "model": 10000,
-        "histogram": -1
-    }
+        "histogram": 30000
+    },
+    "labels_ffhq": [
+        "ffhq"
+    ],
+    "labels": [
+        "hime_winter", "nico", "poppo",
+        "poppo_mix", "sora", "sora_military",
+        "star_breaker", "suguri_winter"
+    ],
+    "labels_all": [
+        "alte", "aru", "aru_scramble", "fernet", "hime", "hime_swimsuit", "hime_winter", "kae", "kiriko", "krila",
+        "kyoko", "marc", "mei", "miusaki", "nanako", "nath", "nath_equipped", "natsumi", "nico", "poppo",
+        "poppo_mix", "qp", "qp_dangerous", "repa", "saki", "sham", "sherry", "sora", "sora_military", "sora_swimsuit",
+        "star_breaker", "suguri", "suguri_swimsuit", "suguri_winter", "sweet_breaker", "syura", "tomomo",
+        "tomomo_casual", "tomomo_sweet_eater", "tsih", "yuki", "yuki_dangerous"
+    ]
 }

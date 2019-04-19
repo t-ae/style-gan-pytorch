@@ -70,18 +70,18 @@ class MinibatchStdConcatLayer(nn.Module):
 
 
 class Blur3x3(nn.Module):
-    def __init__(self, dim):
+    def __init__(self):
         super().__init__()
-        self.dim = dim
 
         f = np.array([1, 2, 1], dtype=np.float32)
         f = f[None, :] * f[:, None]
         f /= np.sum(f)
-        f = f.reshape([1, 1, 3, 3]).repeat(dim, axis=0)
+        f = f.reshape([1, 1, 3, 3])
         self.register_buffer("filter", torch.from_numpy(f))
 
     def forward(self, x):
-        return F.conv2d(x, self.filter, padding=1, groups=self.dim)
+        ch = x.size(1)
+        return F.conv2d(x, self.filter.expand(ch, -1, -1, -1), padding=1, groups=ch)
 
 
 class WSConv2d(nn.Module):
@@ -125,15 +125,15 @@ class AdaIN(nn.Module):
         super().__init__()
         self.dim = dim
         self.epsilon = 1e-8
-        self.transform = WSConv2d(w_dim, dim*2, 1, 1, 0)
+        self.scale_transform = WSConv2d(w_dim, dim, 1, 1, 0, gain=1)
+        self.bias_transform = WSConv2d(w_dim, dim, 1, 1, 0, gain=1)
 
     def forward(self, x, w):
         x = F.instance_norm(x, eps=self.epsilon)
 
         # scale
-        style = self.transform(w).view([-1, 2, self.dim, 1, 1])
-        scale = style[:, 0] + 1
-        bias = style[:, 1]
+        scale = self.scale_transform(w)
+        bias = self.bias_transform(w)
 
         return scale * x + bias
 
@@ -154,13 +154,12 @@ class NoiseLayer(nn.Module):
         if self.fixed:
             noise = self.fixed_noise.expand(batch_size, -1, -1, -1)
         else:
-            noise = torch.randn([batch_size, 1, self.size, self.size]).to(x.device, x.dtype)
-
+            noise = torch.randn([batch_size, 1, self.size, self.size], dtype=x.dtype, device=x.device)
         return x + noise * self.noise_scale
 
 
 class LatentTransformation(nn.Module):
-    def __init__(self, settings):
+    def __init__(self, settings, label_size):
         super().__init__()
 
         self.z_dim = settings["z_dim"]
@@ -168,9 +167,10 @@ class LatentTransformation(nn.Module):
         self.latent_normalization = PixelNormalizationLayer(settings) if settings["normalize_latents"] else None
         activation = nn.LeakyReLU(negative_slope=0.2)
 
-        # outputs [network_dim*2, 1, 1]
+        use_labels = settings["use_labels"]
+
         self.latent_transform = nn.Sequential(
-            WSConv2d(self.z_dim, self.z_dim, 1, 1, 0),
+            WSConv2d(self.z_dim * 2 if use_labels else self.z_dim, self.z_dim, 1, 1, 0),
             activation,
             WSConv2d(self.z_dim, self.z_dim, 1, 1, 0),
             activation,
@@ -186,8 +186,16 @@ class LatentTransformation(nn.Module):
             activation
         )
 
-    def forward(self, latent):
+        if use_labels:
+            self.label_embed = nn.Embedding(label_size, self.z_dim)
+        else:
+            self.label_embed = None
+
+    def forward(self, latent, labels):
         latent = latent.view([-1, self.z_dim, 1, 1])
+        if self.label_embed is not None:
+            labels = self.label_embed(labels).view([-1, self.z_dim, 1, 1])
+            latent = torch.cat([latent, labels], dim=1)
 
         if self.latent_normalization is not None:
             latent = self.latent_normalization(latent)
@@ -196,15 +204,31 @@ class LatentTransformation(nn.Module):
 
 
 class SynthFirstBlock(nn.Module):
-    def __init__(self, start_dim, output_dim, w_dim):
+    def __init__(self, start_dim, output_dim, w_dim, base_image_init, use_noise):
         super().__init__()
 
-        self.base_image = nn.Parameter(torch.ones(1, start_dim, 4, 4))
+        self.base_image = nn.Parameter(torch.empty(1, start_dim, 4, 4))
+        if base_image_init == "zeros":
+            nn.init.zeros_(self.base_image)
+        elif base_image_init == "ones":
+            nn.init.ones_(self.base_image)
+        elif base_image_init == "zero_normal":
+            nn.init.normal_(self.base_image, 0, 1)
+        elif base_image_init == "one_normal":
+            nn.init.normal_(self.base_image, 1, 1)
+        else:
+            print(f"Invalid base_image_init: {base_image_init}")
+            exit(1)
 
         self.conv = WSConv2d(start_dim, output_dim, 3, 1, 1)
 
         self.noise1 = NoiseLayer(start_dim, 4)
         self.noise2 = NoiseLayer(output_dim, 4)
+        if not use_noise:
+            self.noise1.noise_scale.zeros_()
+            self.noise1.fixed = True
+            self.noise2.noise_scale.zeros_()
+            self.noise2.fixed = True
 
         self.adain1 = AdaIN(start_dim, w_dim)
         self.adain2 = AdaIN(output_dim, w_dim)
@@ -228,25 +252,36 @@ class SynthFirstBlock(nn.Module):
 
 
 class SynthBlock(nn.Module):
-    def __init__(self, input_dim, output_dim, output_size, w_dim):
+    def __init__(self, input_dim, output_dim, output_size, w_dim, upsample_mode, use_blur, use_noise):
         super().__init__()
 
         self.conv1 = WSConv2d(input_dim, output_dim, 3, 1, 1)
         self.conv2 = WSConv2d(output_dim, output_dim, 3, 1, 1)
-        self.blur = Blur3x3(output_dim)
+        if use_blur:
+            self.blur = Blur3x3()
+        else:
+            self.blur = None
 
         self.noise1 = NoiseLayer(output_dim, output_size)
         self.noise2 = NoiseLayer(output_dim, output_size)
+        if not use_noise:
+            self.noise1.noise_scale.zeros_()
+            self.noise1.fixed = True
+            self.noise2.noise_scale.zeros_()
+            self.noise2.fixed = True
 
         self.adain1 = AdaIN(output_dim, w_dim)
         self.adain2 = AdaIN(output_dim, w_dim)
 
         self.activation = nn.LeakyReLU(negative_slope=0.2)
 
+        self.upsample_mode = upsample_mode
+
     def forward(self, x, w1, w2):
-        x = F.interpolate(x, scale_factor=2)
+        x = F.interpolate(x, scale_factor=2, mode=self.upsample_mode)
         x = self.conv1(x)
-        x = self.blur(x)
+        if self.blur is not None:
+            x = self.blur(x)
         x = self.noise1(x)
         x = self.activation(x)
         x = self.adain1(x, w1)
@@ -264,20 +299,24 @@ class SynthesisModule(nn.Module):
         super().__init__()
 
         self.w_dim = settings["w_dim"]
+        self.upsample_mode = settings["upsample_mode"]
+        use_blur = settings["use_blur"]
+        use_noise = settings["use_noise"]
+        base_image_init = settings["base_image_init"]
 
         self.blocks = nn.ModuleList([
-            SynthFirstBlock(512, 512, self.w_dim),
-            SynthBlock(512, 512, 8, self.w_dim),
-            SynthBlock(512, 256, 16, self.w_dim),
-            SynthBlock(256, 128, 32, self.w_dim),
-            SynthBlock(128, 64, 64, self.w_dim),
-            SynthBlock(64, 32, 128, self.w_dim),
-            SynthBlock(32, 16, 256, self.w_dim)
+            SynthFirstBlock(256, 256, self.w_dim, base_image_init, use_noise),
+            SynthBlock(256, 256, 8, self.w_dim, self.upsample_mode, use_blur, use_noise),
+            SynthBlock(256, 256, 16, self.w_dim, self.upsample_mode, use_blur, use_noise),
+            SynthBlock(256, 128, 32, self.w_dim, self.upsample_mode, use_blur, use_noise),
+            SynthBlock(128, 64, 64, self.w_dim, self.upsample_mode, use_blur, use_noise),
+            SynthBlock(64, 32, 128, self.w_dim, self.upsample_mode, use_blur, use_noise),
+            SynthBlock(32, 16, 256, self.w_dim, self.upsample_mode, use_blur, use_noise)
         ])
 
         self.to_rgbs = nn.ModuleList([
-            WSConv2d(512, 3, 1, 1, 0, gain=1),
-            WSConv2d(512, 3, 1, 1, 0, gain=1),
+            WSConv2d(256, 3, 1, 1, 0, gain=1),
+            WSConv2d(256, 3, 1, 1, 0, gain=1),
             WSConv2d(256, 3, 1, 1, 0, gain=1),
             WSConv2d(128, 3, 1, 1, 0, gain=1),
             WSConv2d(64, 3, 1, 1, 0, gain=1),
@@ -289,7 +328,7 @@ class SynthesisModule(nn.Module):
 
     def set_noise_fixed(self, fixed):
         for module in self.modules():
-            if module is NoiseLayer:
+            if isinstance(module, NoiseLayer):
                 module.fixed = fixed
 
     def forward(self, w, alpha):
@@ -313,21 +352,30 @@ class SynthesisModule(nn.Module):
             x = x2
         else:
             x1 = self.to_rgbs[level - 2](x)
-            x1 = F.interpolate(x1, scale_factor=2, mode="nearest")
+            x1 = F.interpolate(x1, scale_factor=2, mode=self.upsample_mode)
             x = torch.lerp(x1, x2, alpha)
 
         return x
 
+    def write_histogram(self, writer, step):
+        for lv in range(self.level.item()):
+            block = self.blocks[lv]
+            for name, param in block.named_parameters():
+                writer.add_histogram(f"g_synth_block{lv}/{name}", param.cpu().data.numpy(), step)
+
+        for name, param in self.to_rgbs.named_parameters():
+            writer.add_histogram(f"g_synth_block.torgb/{name}", param.cpu().data.numpy(), step)
+
 
 class Generator(nn.Module):
-    def __init__(self, settings):
+    def __init__(self, settings, label_size):
         super().__init__()
 
-        self.latent_transform = LatentTransformation(settings)
+        self.latent_transform = LatentTransformation(settings, label_size)
         self.synthesis_module = SynthesisModule(settings)
         self.style_mixing_prob = settings["style_mixing_prob"]
 
-        #Truncation trick
+        # Truncation trick
         self.register_buffer("w_average", torch.zeros(1, settings["z_dim"], 1, 1))
         self.w_average_beta = 0.995
         self.trunc_w_layers = 8
@@ -336,15 +384,15 @@ class Generator(nn.Module):
     def set_level(self, level):
         self.synthesis_module.level.fill_(level)
 
-    def forward(self, z, alpha):
+    def forward(self, z, labels, alpha):
         batch_size = z.size()[0]
         level = self.synthesis_module.level.item()
 
-        w = self.latent_transform(z)
+        w = self.latent_transform(z, labels)
 
         # update w_average
         if self.training:
-            self.w_average = torch.lerp(w.detach().mean(0, keepdim=True), self.w_average, self.w_average_beta)
+            self.w_average = torch.lerp(w.mean(0, keepdim=True).detach(), self.w_average, self.w_average_beta)
 
         # w becomes [B, level*2, z_dim, 1, 1]
         # level*2 is because each synthesis block has two points of style inputs
@@ -354,7 +402,7 @@ class Generator(nn.Module):
         # style mixing
         if self.training and level >= 2:
             z_mix = torch.randn_like(z)
-            w_mix = self.latent_transform(z_mix)
+            w_mix = self.latent_transform(z_mix, labels)
             for batch_index in range(batch_size):
                 if np.random.uniform(0, 1) < self.style_mixing_prob:
                     cross_point = np.random.randint(1, level*2)
@@ -370,20 +418,30 @@ class Generator(nn.Module):
 
         return fakes
 
+    def write_histogram(self, writer, step):
+        for name, param in self.latent_transform.named_parameters():
+            writer.add_histogram(f"g_lt/{name}", param.cpu().data.numpy(), step)
+        self.synthesis_module.write_histogram(writer, step)
+        writer.add_histogram("w_average", self.w_average.cpu().data.numpy(), step)
+
 
 class DBlock(nn.Module):
-    def __init__(self, inpit_dim, output_dim):
+    def __init__(self, inpit_dim, output_dim, use_blur):
         super().__init__()
 
         self.conv1 = WSConv2d(inpit_dim, output_dim, 3, 1, 1)
         self.conv2 = WSConv2d(output_dim, output_dim, 3, 1, 1)
-        self.blur = Blur3x3(output_dim)
+        if use_blur:
+            self.blur = Blur3x3()
+        else:
+            self.blur = None
         self.activation = nn.LeakyReLU(negative_slope=0.2)
 
     def forward(self, x):
         x = self.conv1(x)
         x = self.activation(x)
-        x = self.blur(x)
+        if self.blur is not None:
+            x = self.blur(x)
         x = self.conv2(x)
         x = self.activation(x)
         x = F.avg_pool2d(x, kernel_size=2)
@@ -391,12 +449,12 @@ class DBlock(nn.Module):
 
 
 class DLastBlock(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, label_size):
         super().__init__()
 
         self.conv1 = WSConv2d(input_dim, input_dim, 3, 1, 1)
         self.conv2 = WSConv2d(input_dim, input_dim, 4, 1, 0)
-        self.conv3 = WSConv2d(input_dim, 1, 1, 1, 0, gain=1)
+        self.conv3 = WSConv2d(input_dim, label_size, 1, 1, 0, gain=1)
         self.activation = nn.LeakyReLU(negative_slope=0.2)
 
     def forward(self, x):
@@ -409,8 +467,11 @@ class DLastBlock(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, settings):
+    def __init__(self, settings, label_size):
         super().__init__()
+
+        use_blur = settings["use_blur"]
+        self.downsample_mode = settings["upsample_mode"]
 
         self.from_rgbs = nn.ModuleList([
             WSConv2d(3, 16, 1, 1, 0),
@@ -418,18 +479,24 @@ class Discriminator(nn.Module):
             WSConv2d(3, 64, 1, 1, 0),
             WSConv2d(3, 128, 1, 1, 0),
             WSConv2d(3, 256, 1, 1, 0),
-            WSConv2d(3, 512, 1, 1, 0),
-            WSConv2d(3, 512, 1, 1, 0)
+            WSConv2d(3, 256, 1, 1, 0),
+            WSConv2d(3, 256, 1, 1, 0)
         ])
 
+        self.use_labels = settings["use_labels"]
+        if self.use_labels:
+            self.label_size = label_size
+        else:
+            self.label_size = 1
+
         self.blocks = nn.ModuleList([
-            DBlock(16, 32),
-            DBlock(32, 64),
-            DBlock(64, 128),
-            DBlock(128, 256),
-            DBlock(256, 512),
-            DBlock(512, 512),
-            DLastBlock(512)
+            DBlock(16, 32, use_blur),
+            DBlock(32, 64, use_blur),
+            DBlock(64, 128, use_blur),
+            DBlock(128, 256, use_blur),
+            DBlock(256, 256, use_blur),
+            DBlock(256, 256, use_blur),
+            DLastBlock(256, self.label_size)
         ])
 
         self.activation = nn.LeakyReLU(negative_slope=0.2)
@@ -439,13 +506,12 @@ class Discriminator(nn.Module):
     def set_level(self, level):
         self.level.fill_(level)
 
-    def forward(self, x, alpha):
+    def forward(self, x, labels, alpha):
         level = self.level.item()
 
         if level == 1:
             x = self.from_rgbs[-1](x)
             x = self.activation(x)
-            x = self.minibatch_std_concat(x)
             x = self.blocks[-1](x)
         else:
             x2 = self.from_rgbs[-level](x)
@@ -455,7 +521,7 @@ class Discriminator(nn.Module):
             if alpha == 1:
                 x = x2
             else:
-                x1 = F.avg_pool2d(x, 2)
+                x1 = F.interpolate(x, scale_factor=0.5, mode=self.downsample_mode)
                 x1 = self.from_rgbs[-level+1](x1)
                 x1 = self.activation(x1)
 
@@ -464,4 +530,8 @@ class Discriminator(nn.Module):
             for l in range(1, level):
                 x = self.blocks[-level+l](x)
 
-        return x.view([-1, 1])
+        if self.use_labels:
+            x = x.view([-1, self.label_size])
+            return torch.gather(x, 1, labels.view(-1, 1))
+        else:
+            return x.view([-1, 1])
