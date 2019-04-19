@@ -39,7 +39,7 @@ Directory structure must be like below:
 
 ## Example
 
-Sooner or later
+![](./resources/face.png)
 
 ## Training time
 
