@@ -1,6 +1,8 @@
 # Stylegan on PyTorch
 
-- [Paper](https://arxiv.org/abs/1812.04948)
+My implementation of StyleGAN on PyTorch, up to 256x256 generator.
+
+- [Original Paper](https://arxiv.org/abs/1812.04948)
 - [Official implementation(TensorFlow)](https://github.com/NVlabs/stylegan)
 
 ## Run
@@ -37,14 +39,10 @@ Directory structure must be like below:
 
 ```
 
-## Example
+## Result
 
-![](./resources/face.png)
+![face](https://user-images.githubusercontent.com/12446914/56738130-f12cfc00-67a6-11e9-93ea-95abd08d5418.png)
 
 ## Training time
 
-It takes about 3 days to train to 256x256 image generator on single RTX2080 machine.
-
-## Article
-
-Sooner or later
+It took about 3 days to train 256x256 image generator on single RTX2080 machine.
