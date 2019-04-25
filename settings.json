@@ -38,17 +38,5 @@
     },
     "labels": [
         "ffhq"
-    ],
-    "labels8": [
-        "hime_winter", "nico", "poppo",
-        "poppo_mix", "sora", "sora_military",
-        "star_breaker", "suguri_winter"
-    ],
-    "labels_all": [
-        "alte", "aru", "aru_scramble", "fernet", "hime", "hime_swimsuit", "hime_winter", "kae", "kiriko", "krila",
-        "kyoko", "marc", "mei", "miusaki", "nanako", "nath", "nath_equipped", "natsumi", "nico", "poppo",
-        "poppo_mix", "qp", "qp_dangerous", "repa", "saki", "sham", "sherry", "sora", "sora_military", "sora_swimsuit",
-        "star_breaker", "suguri", "suguri_swimsuit", "suguri_winter", "sweet_breaker", "syura", "tomomo",
-        "tomomo_casual", "tomomo_sweet_eater", "tsih", "yuki", "yuki_dangerous"
     ]
 }
